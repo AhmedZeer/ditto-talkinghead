@@ -4,8 +4,11 @@ import queue
 import numpy as np
 import traceback
 from tqdm import tqdm
-import cv2  # Optional: Removed if not using OpenCV
+import cv2
+import os
+import sys
 
+from core.atomic_components.video_stream_writer import VideoStreamWriter  # Import the new VideoStreamWriter
 from core.atomic_components.avatar_registrar import AvatarRegistrar, smooth_x_s_info_lst
 from core.atomic_components.condition_handler import ConditionHandler, _mirror_index
 from core.atomic_components.audio2motion import Audio2Motion
@@ -41,7 +44,7 @@ wav2feat_cfg:
 
 
 class StreamSDK:
-    def __init__(self, cfg_pkl, data_root, display_queue=None, **kwargs):
+    def __init__(self, cfg_pkl, data_root, display_queue=None, stream_command=None, stream_enabled=True, **kwargs):
         [
             avatar_registrar_cfg,
             condition_handler_cfg,
@@ -55,6 +58,7 @@ class StreamSDK:
         
         self.default_kwargs = default_kwargs
         
+        # Initialize components
         self.avatar_registrar = AvatarRegistrar(**avatar_registrar_cfg)
         self.condition_handler = ConditionHandler(**condition_handler_cfg)
         self.audio2motion = Audio2Motion(lmdm_cfg)
@@ -62,16 +66,23 @@ class StreamSDK:
         self.warp_f3d = WarpF3D(warp_network_cfg)
         self.decode_f3d = DecodeF3D(decoder_cfg)
         self.putback = PutBack()
-
         self.wav2feat = Wav2Feat(**wav2feat_cfg)
-        
         self.display_queue = display_queue  # Queue to send frames for display
+
+        # Setup streaming if enabled
+        self.stream_enabled = stream_enabled
+        if self.stream_enabled:
+            if stream_command is None:
+                raise ValueError("Stream command must be provided when streaming is enabled.")
+            # Define default resolution or extract from source later
+            self.stream_writer = None  # Will be initialized in setup()
 
     def _merge_kwargs(self, default_kwargs, run_kwargs):
         for k, v in default_kwargs.items():
             if k not in run_kwargs:
                 run_kwargs[k] = v
         return run_kwargs
+
 
     def setup_Nd(self, N_d, fade_in=-1, fade_out=-1, ctrl_info=None):
         # for eye open at video end
@@ -96,8 +107,8 @@ class StreamSDK:
                 ctrl_info[i] = item
         self.ctrl_info = ctrl_info
 
-    def setup(self, source_path, output_path, **kwargs):
-        # ======== Prepare Options ========
+    def setup(self, source_path, output_path, stream_command=None, **kwargs):
+        # Existing setup implementation
         kwargs = self._merge_kwargs(self.default_kwargs, kwargs)
         print("=" * 20, "setup kwargs", "=" * 20)
         print_cfg(**kwargs)
@@ -182,10 +193,10 @@ class StreamSDK:
         self.source_info = source_info
         self.source_info_frames = len(source_info["x_s_info_lst"])
 
-        # ======== Setup Condition Handler ========
+        # Condition Handler Setup
         self.condition_handler.setup(source_info, self.emo, eye_f0_mode=self.eye_f0_mode, ch_info=self.ch_info)
 
-        # ======== Setup Audio2Motion (LMDM) ========
+        # Audio2Motion Setup
         x_s_info_0 = self.condition_handler.x_s_info_0
         self.audio2motion.setup(
             x_s_info_0, 
@@ -198,7 +209,7 @@ class StreamSDK:
             smo_k_d=self.smo_k_d,
         )
 
-        # ======== Setup Motion Stitch ========
+        # Motion Stitch Setup
         is_image_flag = source_info["is_image_flag"]
         x_s_info = source_info['x_s_info_lst'][0]
         self.motion_stitch.setup(
@@ -218,10 +229,25 @@ class StreamSDK:
             overall_ctrl_info=self.overall_ctrl_info,
         )
 
-        # ======== Video Writer ========
-        self.output_path = output_path
-        self.tmp_output_path = output_path + ".tmp.mp4"
-        self.writer = VideoWriterByImageIO(self.tmp_output_path)
+        # Video Writer Setup
+        if self.stream_enabled:
+            # Initialize VideoStreamWriter
+            # Assuming width and height from source_info
+            self.stream_writer = VideoStreamWriter(
+                stream_command=stream_command,
+                fps=kwargs.get("fps", 25),
+                width=source_info["width"],
+                height=source_info["height"],
+                pix_fmt=kwargs.get("pix_fmt", "yuv420p"),
+                crf=kwargs.get("crf", 18)
+            )
+            self.writer = self.stream_writer
+        else:
+            # Use VideoWriterByImageIO as before
+            self.output_path = output_path
+            self.tmp_output_path = output_path + ".tmp.mp4"
+            self.writer = VideoWriterByImageIO(self.tmp_output_path)
+        
         self.writer_pbar = tqdm(desc="writer")
 
         # ======== Audio Feat Buffer ========
@@ -235,7 +261,6 @@ class StreamSDK:
 
         # ======== Setup Worker Threads ========
         QUEUE_MAX_SIZE = 100
-        # self.QUEUE_TIMEOUT = None
 
         self.worker_exception = None
         self.stop_event = threading.Event()
@@ -292,9 +317,28 @@ class StreamSDK:
             if self.display_queue is not None:
                 self.display_queue.put(res_frame_rgb)
             
-            # Write the frame to the video file
+            # Write the frame to the stream or file
             self.writer(res_frame_rgb, fmt="rgb")
             self.writer_pbar.update()
+
+    def close(self):
+        # Existing close implementation
+        self.audio2motion_queue.put(None)
+        for thread in self.thread_list:
+            thread.join()
+
+        try:
+            self.writer.close()
+            self.writer_pbar.close()
+        except:
+            traceback.print_exc()
+
+        if self.stream_enabled and self.stream_writer:
+            if not self.stream_writer.is_alive():
+                print("FFmpeg subprocess terminated unexpectedly.", file=sys.stderr)
+
+        if self.worker_exception is not None:
+            raise self.worker_exception
 
     def putback_worker(self):
         try:
@@ -487,22 +531,6 @@ class StreamSDK:
         
         self.motion_stitch_queue.put(None)
 
-    def close(self):
-        # flush frames
-        self.audio2motion_queue.put(None)
-        # Wait for worker threads to finish
-        for thread in self.thread_list:
-            thread.join()
-
-        try:
-            self.writer.close()
-            self.writer_pbar.close()
-        except:
-            traceback.print_exc()
-
-        # Check if any worker encountered an exception
-        if self.worker_exception is not None:
-            raise self.worker_exception
 
     def run_chunk(self, audio_chunk, chunksize=(3, 5, 2)):
         # only for hubert
