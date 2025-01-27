@@ -1,8 +1,10 @@
+# stream_pipeline_online.py
 import threading
 import queue
 import numpy as np
 import traceback
 from tqdm import tqdm
+import cv2  # Optional: Removed if not using OpenCV
 
 from core.atomic_components.avatar_registrar import AvatarRegistrar, smooth_x_s_info_lst
 from core.atomic_components.condition_handler import ConditionHandler, _mirror_index
@@ -39,8 +41,7 @@ wav2feat_cfg:
 
 
 class StreamSDK:
-    def __init__(self, cfg_pkl, data_root, **kwargs):
-
+    def __init__(self, cfg_pkl, data_root, display_queue=None, **kwargs):
         [
             avatar_registrar_cfg,
             condition_handler_cfg,
@@ -63,6 +64,8 @@ class StreamSDK:
         self.putback = PutBack()
 
         self.wav2feat = Wav2Feat(**wav2feat_cfg)
+        
+        self.display_queue = display_queue  # Queue to send frames for display
 
     def _merge_kwargs(self, default_kwargs, run_kwargs):
         for k, v in default_kwargs.items():
@@ -94,7 +97,6 @@ class StreamSDK:
         self.ctrl_info = ctrl_info
 
     def setup(self, source_path, output_path, **kwargs):
-
         # ======== Prepare Options ========
         kwargs = self._merge_kwargs(self.default_kwargs, kwargs)
         print("=" * 20, "setup kwargs", "=" * 20)
@@ -286,6 +288,11 @@ class StreamSDK:
             if item is None:
                 break
             res_frame_rgb = item
+            
+            if self.display_queue is not None:
+                self.display_queue.put(res_frame_rgb)
+            
+            # Write the frame to the video file
             self.writer(res_frame_rgb, fmt="rgb")
             self.writer_pbar.update()
 
@@ -496,7 +503,7 @@ class StreamSDK:
         # Check if any worker encountered an exception
         if self.worker_exception is not None:
             raise self.worker_exception
-        
+
     def run_chunk(self, audio_chunk, chunksize=(3, 5, 2)):
         # only for hubert
         aud_feat = self.wav2feat(audio_chunk, chunksize=chunksize)
@@ -506,6 +513,3 @@ class StreamSDK:
                 break
             except queue.Full:
                 continue
-
-
-
